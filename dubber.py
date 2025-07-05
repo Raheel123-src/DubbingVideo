@@ -8,53 +8,18 @@ from datetime import timedelta
 import requests
 import openai
 from dotenv import load_dotenv
-import boto3
-from botocore.exceptions import ClientError
 
 # Load environment variables
 load_dotenv()
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID = os.getenv("VOICE_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
-
 openai.api_key = OPENAI_API_KEY
 
 app = FastAPI()
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# Initialize S3 client
-s3_client = boto3.client(
-    's3',
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION
-)
-
-
-def upload_to_s3(file_path: str, s3_key: str) -> str:
-    """Upload a file to S3 and return the public URL"""
-    try:
-        s3_client.upload_file(file_path, S3_BUCKET_NAME, s3_key)
-        s3_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
-        return s3_url
-    except ClientError as e:
-        raise Exception(f"Failed to upload to S3: {str(e)}")
-
-
-def cleanup_local_files(file_paths: list):
-    """Clean up local files after processing"""
-    for file_path in file_paths:
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        except Exception as e:
-            print(f"Warning: Could not remove {file_path}: {e}")
 
 
 def generate_audio_from_text(text: str, lang: str, session_id: str):
@@ -187,16 +152,12 @@ async def transcribe_and_translate(
     video: UploadFile = File(...),
     lang: str = Form(...)
 ):
-    local_files_to_cleanup = []
-    
     try:
         file_ext = os.path.splitext(video.filename)[1]
         session_id = str(uuid.uuid4())
         raw_video_path = os.path.join(UPLOAD_DIR, f"original_{session_id}{file_ext}")
-        
         with open(raw_video_path, "wb") as f:
             f.write(await video.read())
-        local_files_to_cleanup.append(raw_video_path)
 
         extracted_audio_path = extract_audio(raw_video_path)
         segments = transcribe_audio(extracted_audio_path)
@@ -212,31 +173,20 @@ async def transcribe_and_translate(
         trans_path = os.path.join(UPLOAD_DIR, f"translated_{session_id}.txt")
         save_transcript(orig_path, original)
         save_transcript(trans_path, translated)
-        local_files_to_cleanup.extend([orig_path, trans_path])
 
         translated_text_full = " ".join([seg["text"] for seg in translated])
         dubbed_audio_path = generate_audio_from_text(translated_text_full, lang, session_id)
-        local_files_to_cleanup.append(dubbed_audio_path)
 
         final_dubbed_video_path = create_final_dubbed_video(raw_video_path, dubbed_audio_path, session_id)
-        local_files_to_cleanup.append(final_dubbed_video_path)
-
-        # Upload final dubbed video to S3
-        s3_key = f"dubbed_videos/{session_id}_final_dubbed.mp4"
-        s3_url = upload_to_s3(final_dubbed_video_path, s3_key)
-
-        # Clean up all local files
-        cleanup_local_files(local_files_to_cleanup)
 
         return {
-            "success": True,
-            "s3_url": s3_url,
-            "session_id": session_id,
-            "language": lang,
-            "message": "Video successfully dubbed and uploaded to S3"
+            "original_video_file": raw_video_path,
+            "dubbed_audio_file": dubbed_audio_path,
+            "final_dubbed_video_file": final_dubbed_video_path,
+            "original_transcript_file": orig_path,
+            "translated_transcript_file": trans_path,
+            "language": lang
         }
 
     except Exception as e:
-        # Clean up files even if there's an error
-        cleanup_local_files(local_files_to_cleanup)
         return JSONResponse(status_code=500, content={"error": str(e)})
