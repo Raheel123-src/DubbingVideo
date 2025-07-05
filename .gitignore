@@ -1,1 +1,4 @@
 .env
+ modal_app.py
+   env_template.txt
+   MODAL_DEPLOYMENT.md
