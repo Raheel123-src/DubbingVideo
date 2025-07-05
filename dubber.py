@@ -4,17 +4,23 @@ import whisper
 import ffmpeg
 import os
 import uuid
-from googletrans import Translator
 from datetime import timedelta
 import requests
+import openai
+from dotenv import load_dotenv
 
-ELEVENLABS_API_KEY = "sk_b9131e572f79e0564d14a0a89b9ba7643d681497a7d98876"  
-VOICE_ID = "P1bg08DkjqiVEzOn76yG" 
+# Load environment variables
+load_dotenv()
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+VOICE_ID = os.getenv("VOICE_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
 
 app = FastAPI()
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 
 def generate_audio_from_text(text: str, lang: str, session_id: str):
     output_path = os.path.join(UPLOAD_DIR, f"audio_{session_id}.mp3")
@@ -44,31 +50,65 @@ def generate_audio_from_text(text: str, lang: str, session_id: str):
     else:
         raise Exception(f"ElevenLabs API Error {response.status_code}: {response.text}")
 
+
 def extract_audio(video_path):
     audio_path = f"/tmp/{uuid.uuid4()}.mp3"
     ffmpeg.input(video_path).output(audio_path).run(overwrite_output=True)
     return audio_path
 
+
 def format_timestamp(seconds: float):
     td = str(timedelta(seconds=int(seconds)))
     return td if '.' in td else td + ".000"
+
 
 def transcribe_audio(audio_path):
     model = whisper.load_model("base")
     result = model.transcribe(audio_path, verbose=False)
     return result['segments']
 
+
 def translate_segments(segments, target_lang):
-    translator = Translator()
     translated = []
+
     for seg in segments:
-        text = translator.translate(seg["text"], dest=target_lang).text
-        translated.append({
-            "start": format_timestamp(seg["start"]),
-            "end": format_timestamp(seg["end"]),
-            "text": text
-        })
+        prompt = (
+            f"Translate the following sentence into {target_lang} using modern, simple, "
+            f"and conversational language. Avoid overly formal or harsh words. "
+            f"Only return the translated sentence:\n\n\"{seg['text']}\"\n"
+        )
+
+        try:
+            print(f"[Translating] {seg['text'][:60]}...")
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a helpful translator that outputs clear and modern translations."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=200,
+                temperature=0.7
+            )
+
+            translated_text = response.choices[0].message.content.strip()
+            print(f"[✅ Translated] {translated_text}")
+
+            translated.append({
+                "start": format_timestamp(seg["start"]),
+                "end": format_timestamp(seg["end"]),
+                "text": translated_text
+            })
+
+        except Exception as e:
+            print(f"[❌ Error] {e}")
+            translated.append({
+                "start": format_timestamp(seg["start"]),
+                "end": format_timestamp(seg["end"]),
+                "text": "translation failed"
+            })
+
     return translated
+
 
 def format_segments(segments):
     return [{
@@ -77,50 +117,18 @@ def format_segments(segments):
         "text": seg["text"]
     } for seg in segments]
 
+
 def save_transcript(file_path, segments):
     with open(file_path, "w", encoding="utf-8") as f:
         for seg in segments:
             f.write(f"[{seg['start']} --> {seg['end']}] {seg['text']}\n")
 
-def stitch_audio_to_video(video_path: str, audio_path: str, session_id: str):
-    temp_video_path = os.path.join(OUTPUT_DIR, f"temp_video_{session_id}.mp4")
-    output_video_path = os.path.join(OUTPUT_DIR, f"final_dubbed_video_{session_id}.mp4")
-
-    # Step 1: Remove original audio
-    ffmpeg.input(video_path).output(temp_video_path, vcodec='copy', an=None).run(overwrite_output=True)
-
-    # Step 2: Combine silent video and new audio
-    input_video = ffmpeg.input(temp_video_path)
-    input_audio = ffmpeg.input(audio_path)
-
-    (
-        ffmpeg
-        .output(input_video, input_audio, output_video_path,
-                vcodec='copy',
-                acodec='aac',
-                strict='experimental',
-                shortest=None,
-                **{'map': '0:v:0', 'map': '1:a:0'})  # map video from input 0 and audio from input 1
-        .run(overwrite_output=True)
-    )
-
-    os.remove(temp_video_path)
-
-    print(f"✅ Final dubbed video created at: {output_video_path}")
-    return output_video_path
 
 def create_final_dubbed_video(video_path: str, audio_path: str, session_id: str):
-    """
-    Removes the original audio from the input video and stitches the given audio file in its place.
-    Returns the final output video path.
-    """
     temp_video_path = os.path.join(UPLOAD_DIR, f"temp_video_{session_id}.mp4")
     output_video_path = os.path.join(UPLOAD_DIR, f"final_vid_{session_id}.mp4")
 
-    # Step 1: Strip original audio
     ffmpeg.input(video_path).output(temp_video_path, vcodec='copy', an=None).run(overwrite_output=True)
-
-    # Step 2: Stitch new audio
     input_video = ffmpeg.input(temp_video_path)
     input_audio = ffmpeg.input(audio_path)
 
@@ -145,33 +153,30 @@ async def transcribe_and_translate(
     lang: str = Form(...)
 ):
     try:
-        # Save uploaded video
         file_ext = os.path.splitext(video.filename)[1]
         session_id = str(uuid.uuid4())
         raw_video_path = os.path.join(UPLOAD_DIR, f"original_{session_id}{file_ext}")
         with open(raw_video_path, "wb") as f:
             f.write(await video.read())
 
-        # Transcribe original audio
         extracted_audio_path = extract_audio(raw_video_path)
         segments = transcribe_audio(extracted_audio_path)
         os.remove(extracted_audio_path)
 
-        # Format and translate
         original = format_segments(segments)
         translated = translate_segments(segments, lang)
 
-        # Save transcripts
+        if all(seg["text"].lower() == "translation failed" for seg in translated):
+            raise Exception("❌ All segments failed translation. Check OpenAI API or rate limits.")
+
         orig_path = os.path.join(UPLOAD_DIR, f"original_{session_id}.txt")
         trans_path = os.path.join(UPLOAD_DIR, f"translated_{session_id}.txt")
         save_transcript(orig_path, original)
         save_transcript(trans_path, translated)
 
-        # Generate new audio
         translated_text_full = " ".join([seg["text"] for seg in translated])
         dubbed_audio_path = generate_audio_from_text(translated_text_full, lang, session_id)
 
-        # Stitch dubbed audio to video
         final_dubbed_video_path = create_final_dubbed_video(raw_video_path, dubbed_audio_path, session_id)
 
         return {
